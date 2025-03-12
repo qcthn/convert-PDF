@@ -1,150 +1,262 @@
+
 import streamlit as st
-import pdfplumber
-from pdf2image import convert_from_path
-import pytesseract
-from PIL import Image
-import io
+import openai
+import time
+from collections import deque
+from io import BytesIO
+from pptx import Presentation
 from docx import Document
+from PyPDF2 import PdfReader, PdfWriter
+import pandas as pd
+from pptx.util import Pt
 import os
-import shutil
 
-# Đảm bảo Tesseract được cài đặt và cấu hình đúng trên hệ thống
-# Ví dụ: cài gói tiếng Việt nếu cần: `tesseract-ocr-vie`
 
-# Hàm trích xuất văn bản từ PDF
-def extract_text_from_pdf(pdf_path):
+# Rate limiting parameters
+MAX_REQUESTS_PER_MINUTE = 3500
+MAX_TOKENS_PER_MINUTE = 90000
+WINDOW_SECONDS = 60
+requests_timestamps = deque()
+tokens_timestamps = deque()
+
+standard_prompt = "Bạn là một trợ lý AI dịch thuật. Hãy dịch văn bản sau từ tiếng Anh sang tiếng Việt, ưu tiên dùng đúng các thuật ngữ chuyên ngành (nếu có). Trước tiên hay tra cứu từ vựng trong câu có từ  nào thuộc từ vựng nằm trong file từ vựng chuyên ngành mà tôi cung cấp không, nếu có hãy dùng nghĩa tiếng việt của từ vựng chuyên ngành đó được cung cấp trong file xlsx, các từ còn lại bạn có thể dịch tự động. ** Lưu ý mỗi câu chỉ được phép dịch 1 lần duy nhất, ngoài ra nếu đó là mội chuỗi kí tự bất kì không phải là bất kì từ tiếng anh nào thì đó có thể là kí hiệu hoặc mã của sản phẩm bạn có thể giữ nguyên và không cần dịch sang tiếng việt. Nếu đầu vào (input) không có nội dung thì bạn có thể bỏ qua và không trả về kết quả gì hết ( không trả output)."
+
+def check_and_wait_for_rate_limit(tokens_used: int):
+    current_time = time.time()
+    while requests_timestamps and (current_time - requests_timestamps[0] > WINDOW_SECONDS):
+        requests_timestamps.popleft()
+    while tokens_timestamps and (current_time - tokens_timestamps[0][0] > WINDOW_SECONDS):
+        tokens_timestamps.popleft()
+    current_requests = len(requests_timestamps)
+    current_tokens = sum(t[1] for t in tokens_timestamps)
+    if current_requests + 1 > MAX_REQUESTS_PER_MINUTE or current_tokens + tokens_used > MAX_TOKENS_PER_MINUTE:
+        time.sleep(1)
+        return check_and_wait_for_rate_limit(tokens_used)
+    requests_timestamps.append(current_time)
+    tokens_timestamps.append((current_time, tokens_used))
+
+def load_specialized_dict_from_excel(excel_file):
+    if excel_file is None:
+        return {}
+    df = pd.read_excel(excel_file)
+    return {str(row['English']).strip(): str(row['Vietnamese']).strip() for _, row in df.iterrows() if row['English'] and row['Vietnamese']}
+
+
+
+
+from pptx.util import Pt
+
+def adjust_text_fit(text_frame, shape):
     """
-    Trích xuất văn bản từ file PDF. Nếu văn bản không thể trích xuất trực tiếp,
-    chuyển đổi PDF thành hình ảnh và sử dụng OCR.
+    Adjust text font size dynamically to fit within the text box without overflow.
+    Uses shape.width and shape.height instead of text_frame.width.
+    """
+    max_width = shape.width  # Get the width of the text box
+    max_height = shape.height  # Get the height of the text box
+    min_font_size = Pt(8)  # Set a minimum font size to maintain readability
+
+    for para in text_frame.paragraphs:
+        for run in para.runs:
+            if run.font.size and run.font.size > min_font_size:
+                run.font.size = max(min_font_size, run.font.size * 0.9)  # Reduce font size if needed
+
+def distribute_text_across_runs(para, translated_text):
+    """
+    Phân phối đều văn bản đã dịch qua các run trong khi giữ nguyên định dạng.
+    """
+    original_text = "".join(run.text for run in para.runs)
+    if not original_text.strip():
+        return
+
+    total_original_len = len(original_text)
+    if total_original_len == 0:
+        return
+
+    remaining_text = translated_text
+    for run in para.runs:
+        if not run.text:
+            continue
+
+        # Tính toán phân phối văn bản theo tỷ lệ
+        run_len = len(run.text)
+        portion = min(run_len / total_original_len, 1.0)
+        chars_to_take = int(len(translated_text) * portion)
+
+        # Cập nhật văn bản trong khi giữ nguyên định dạng
+        run.text = remaining_text[:chars_to_take]
+        remaining_text = remaining_text[chars_to_take:]
+
+        # Giữ nguyên định dạng (font, cỡ chữ, in đậm, in nghiêng, màu sắc)
+        if run.font is not None:
+            run.font.name = run.font.name  # Giữ font chữ
+            run.font.size = run.font.size  # Giữ cỡ chữ
+            run.font.bold = run.font.bold  # Giữ in đậm
+            run.font.italic = run.font.italic  # Giữ in nghiêng
+            
+            if run.font.color and hasattr(run.font.color, 'rgb'):
+                run.font.color.rgb = run.font.color.rgb  # Giữ màu sắc
+
+    # Gắn phần văn bản còn lại vào run cuối cùng (nếu có)
+    if remaining_text and para.runs:
+        para.runs[-1].text += remaining_text
+def delete_unwanted_slides(pr, start_slide, end_slide):
+    """
+    Xóa các slide không nằm trong khoảng start_slide đến end_slide, đảm bảo hoạt động chính xác ngay cả khi
+    chỉ lấy một phạm vi nhỏ từ một tệp lớn.
+
+    Args:
+        pr (Presentation): Đối tượng PowerPoint cần xử lý.
+        start_slide (int): Slide bắt đầu giữ lại (chỉ mục 1-based).
+        end_slide (int): Slide kết thúc giữ lại (chỉ mục 1-based).
+    """
+    total_slides = len(pr.slides)
+
+    # Kiểm tra nếu phạm vi nằm ngoài số lượng slide có sẵn
+    if start_slide < 1 or end_slide > total_slides or start_slide > end_slide:
+        raise ValueError("Phạm vi slide không hợp lệ! Vui lòng nhập giá trị hợp lệ.")
+
+    # Danh sách các index slide cần giữ lại
+    keep_slides = set(range(start_slide - 1, end_slide))
+
+    # Lấy danh sách các slide ID thực sự trong XML
+    xml_slides = pr.slides._sldIdLst
+    slides = list(xml_slides)
+
+    # Xóa những slide không thuộc phạm vi cần giữ lại (từ cuối về đầu)
+    for i in reversed(range(total_slides)):
+        if i not in keep_slides:
+            pr.part.drop_rel(slides[i].rId)
+            xml_slides.remove(slides[i])
+
+def translate_pptx(pptx_file: BytesIO, api_key: str, specialized_dict: dict[str, str],start_slide: int, end_slide: int) -> BytesIO:
+    """
+    Dịch văn bản trong file PowerPoint từ tiếng Anh sang tiếng Việt, giữ nguyên font, cỡ chữ và màu sắc gốc.
+    Xử lý văn bản tràn bằng cách điều chỉnh cỡ chữ động.
     
     Args:
-        pdf_path (str): Đường dẫn đến file PDF.
-    Returns:
-        str: Văn bản trích xuất từ file PDF.
-    """
-    text = ""
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                # Thử trích xuất văn bản trực tiếp
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-                else:
-                    # Nếu không có văn bản, chuyển đổi trang thành hình ảnh và dùng OCR
-                    images = convert_from_path(pdf_path, first_page=page_num, last_page=page_num)
-                    for image in images:
-                        text += pytesseract.image_to_string(image, lang='eng+vie') + "\n"
-    except Exception as e:
-        st.error(f"Lỗi khi xử lý PDF: {e}")
-        return None
-    return text
-
-# Hàm trích xuất văn bản từ hình ảnh
-def extract_text_from_image(image_path):
-    """
-    Trích xuất văn bản từ file hình ảnh bằng OCR.
+        pptx_file: Đối tượng BytesIO chứa file PPTX
+        api_key: Khóa API OpenAI
+        specialized_dict: Từ điển thuật ngữ chuyên ngành (Anh -> Việt)
     
-    Args:
-        image_path (str): Đường dẫn đến file hình ảnh.
     Returns:
-        str: Văn bản trích xuất từ hình ảnh.
+        Đối tượng BytesIO chứa file PPTX đã dịch
     """
-    try:
-        image = Image.open(image_path)
-        text = pytesseract.image_to_string(image, lang='eng+vie')
-        return text
-    except Exception as e:
-        st.error(f"Lỗi khi xử lý hình ảnh: {e}")
-        return None
+    pr = Presentation(pptx_file)
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    # new_presentation = Presentation()
+    # for i, slide in enumerate(pr.slides):
+    #     status_text.text(f"Đang dịch slide {i+1}/{total_slides}...")
+    # slides_to_delete = [i for i in range(total_slides) if i < start_slide - 1 or i >= end_slide]
 
-# Hàm tạo file Word từ văn bản
-def create_word_file(text, output_path):
-    """
-    Tạo file Word từ văn bản trích xuất.
-    
-    Args:
-        text (str): Văn bản cần ghi vào file Word.
-        output_path (str): Đường dẫn đến file Word đầu ra.
-    Returns:
-        bool: True nếu tạo file thành công, False nếu thất bại.
-    """
-    try:
-        doc = Document()
-        doc.add_paragraph(text)
-        doc.save(output_path)
-        return True
-    except Exception as e:
-        st.error(f"Lỗi khi tạo file Word: {e}")
-        return False
+    # for index in reversed(slides_to_delete):  # Xóa từ cuối về đầu để tránh lỗi index
+    #     xml_slides = pr.slides._sldIdLst  
+    #     slides = list(xml_slides)
+    #     pr.part.drop_rel(slides[index].rId)
+    #     xml_slides.remove(slides[index])
+    # delete_unwanted_slides(pr, start_slide, end_slide)
+    total_slides = len(pr.slides)
+    for i in range(start_slide - 1, end_slide):
+    # for i, slide in enumerate(total_slides):
+        slide = pr.slides[i]
+        status_text.text(f"Đang dịch slide {i+1}/{end_slide}...")
 
-# Hàm chính để chạy ứng dụng
-def main():
-    """Xây dựng giao diện Streamlit và xử lý logic chính của ứng dụng."""
-    st.title("Trích Xuất Văn Bản Từ CV")
-    st.write("Tải lên CV (PDF hoặc hình ảnh) để trích xuất văn bản và nhận file Word.")
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                text_frame = shape.text_frame
 
-    # Tạo thư mục tạm nếu chưa tồn tại
-    temp_dir = "temp"
-    if not os.path.exists(temp_dir):
-        os.makedirs(temp_dir)
+                for para in text_frame.paragraphs:
+                    if not para.text.strip():
+                        continue
 
-    # Widget tải file
-    uploaded_file = st.file_uploader(
-        "Chọn file CV", type=["pdf", "png", "jpg", "jpeg"]
-    )
+                    # Thu thập văn bản gốc
+                    original_text = "".join(run.text for run in para.runs)
+                    translated_text = translate_text_with_chatgpt(original_text, api_key, specialized_dict)
 
-    if uploaded_file is not None:
-        # Lưu file tạm thời
-        temp_file_path = os.path.join(temp_dir, uploaded_file.name)
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+                    # Bỏ qua nếu không có bản dịch hoặc bản dịch không thay đổi
+                    if not translated_text or translated_text == original_text or translated_text == 'Xin lỗi, nhưng văn bản bạn cung cấp không đủ để dịch. Bạn có thể cung cấp thêm ngữ cảnh hoặc thông tin chi tiết hơn không?':
+                        continue
 
-        # Xác định loại file và trích xuất văn bản
-        file_type = uploaded_file.type
-        if file_type == "application/pdf":
-            st.write("Đang xử lý file PDF...")
-            text = extract_text_from_pdf(temp_file_path)
-        else:
-            st.write("Đang xử lý file hình ảnh...")
-            text = extract_text_from_image(temp_file_path)
+                    # Phân phối văn bản đã dịch qua các run
+                    distribute_text_across_runs(para, translated_text)
 
-        # Kiểm tra kết quả trích xuất
-        if text:
-            st.success("Trích xuất văn bản thành công!")
-            st.text_area("Văn bản trích xuất", text, height=200)
+                # Điều chỉnh kích thước văn bản để tránh tràn
+                adjust_text_fit(text_frame, shape)
 
-            # Tạo file Word
-            output_path = os.path.join(temp_dir, "cv_output.docx")
-            if create_word_file(text, output_path):
-                with open(output_path, "rb") as file:
-                    st.download_button(
-                        label="Tải xuống file Word",
-                        data=file,
-                        file_name="cv_text.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-        else:
-            st.error("Không thể trích xuất văn bản từ file.")
+            elif shape.has_table:
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        text_frame = cell.text_frame
+                        for para in text_frame.paragraphs:
+                            if not para.text.strip():
+                                continue
+                            # Thu thập văn bản gốc từ các run
+                            original_text = "".join(run.text for run in para.runs)
+                            translated_text = translate_text_with_chatgpt(original_text, api_key, specialized_dict)
+                            # Chỉ cập nhật nếu bản dịch hợp lệ
+                            if translated_text and translated_text != original_text and translated_text != 'Xin lỗi, nhưng văn bản bạn cung cấp không đủ để dịch. Bạn có thể cung cấp thêm ngữ cảnh hoặc thông tin chi tiết hơn không?':
+                                distribute_text_across_runs(para, translated_text)
+                        # Tùy chọn: Điều chỉnh kích thước văn bản trong ô (nếu cần)
+                                # adjust_text_fit_for_cell(cell)
 
-        # Dọn dẹp file tạm thời
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-        if os.path.exists(output_path):
-            os.remove(output_path)
+        progress_bar.progress((i+1 - (start_slide - 1)) / (end_slide - start_slide + 1))
+    delete_unwanted_slides(pr, start_slide, end_slide)
+    output = BytesIO()
+    pr.save(output)
+    output.seek(0)
+    status_text.text("Dịch PPTX hoàn tất!")
+    return output
 
-    # Hiển thị hướng dẫn
-    st.sidebar.header("Hướng dẫn")
-    st.sidebar.write("""
-    1. Tải lên file CV (PDF hoặc hình ảnh).
-    2. Chờ xử lý và xem văn bản trích xuất.
-    3. Tải xuống file Word chứa văn bản.
-    """)
+# Streamlit UI
+st.set_page_config(page_title="Auto Translator App with Full Formatting")
+st.title("VN DITECH JSC")
+st.subheader("_Hỗ trợ dịch tài liệu :orange[(PowerPoint)] Anh - Việt_", divider="orange")
 
-if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        # Dọn dẹp thư mục tạm khi ứng dụng kết thúc (tùy chọn)
-        if os.path.exists("temp"):
-            shutil.rmtree("temp")
+
+if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
+    api_key = st.secrets["openai"]["api_key"]
+else:
+    api_key = st.text_input("Nhập OpenAI API Key:", type="password")
+
+if api_key:
+    st.write("✅ Ditech Key đã được nhập!")
+uploaded_excel_dict = st.file_uploader("Tải file từ điển nếu có ( Excel )", type=["xlsx"])
+specialized_dict = load_specialized_dict_from_excel(uploaded_excel_dict)
+
+uploaded_file = st.file_uploader("Tải lên file cần dịch (PPTX)", type=["pptx"])
+
+if uploaded_file:
+    pr = Presentation(uploaded_file)
+    total_slides = len(pr.slides)
+    start_slide = st.number_input("Chọn trang bắt đầu", min_value=1, max_value=total_slides, value=1)
+    end_slide = st.number_input("Chọn trang kết thúc", min_value=start_slide, max_value=total_slides, value=total_slides)
+    # Thêm một hộp nhập liệu để hiển thị và chỉnh sửa prompt trước khi dịch
+    custom_prompt = st.text_area("Chỉnh sửa prompt trước khi dịch (hoặc giữ nguyên nếu không thay đổi):", standard_prompt)
+    if st.button("Dịch file PPTX") and api_key:
+        # Sử dụng prompt đã chỉnh sửa nếu có thay đổi, ngược lại giữ nguyên standard_prompt
+        final_prompt = custom_prompt.strip() if custom_prompt.strip() else standard_prompt
+        # output = translate_pptx(uploaded_file, api_key, specialized_dict, start_slide, end_slide)
+        # file_name = "VN_" + uploaded_file.name
+        # st.download_button("Tải về file đã dịch", output, file_name )
+        def translate_text_with_chatgpt(original_text, api_key, global_dict=None):
+            if not original_text.strip():
+                return original_text
+            partial_dict = {eng: vie for eng, vie in global_dict.items() if eng.lower() in original_text.lower()} if global_dict else {}
+            dict_prompt = "\n".join([f"{k}: {v}" for k, v in partial_dict.items()]) if partial_dict else ""
+            user_prompt = f"{dict_prompt}\n\n{original_text}"
+            client = openai.OpenAI(api_key=api_key)
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": final_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=2048
+            )
+            translated_text = response.choices[0].message.content
+            check_and_wait_for_rate_limit(response.usage.total_tokens if response.usage else 0)
+            return translated_text
+        output = translate_pptx(uploaded_file, api_key, specialized_dict, start_slide, end_slide)
+        file_name = "VN_" + uploaded_file.name
+        st.download_button("Tải về file đã dịch", output, file_name)
